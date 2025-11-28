@@ -1,0 +1,108 @@
+name: Cherry Pick Multiple Stories or Commits to UAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      story_ids:
+        description: "Enter comma-separated Story IDs (e.g. ST-101,ST-205)"
+        required: false
+        type: string
+
+      commit_ids:
+        description: "Enter comma-separated Commit IDs (optional)"
+        required: false
+        type: string
+
+jobs:
+  cherry_pick:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout full repo history
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # STEP 1 → Convert comma-separated input into arrays
+      - name: Parse inputs
+        id: parse
+        run: |
+          echo "stories=$(echo '${{ github.event.inputs.story_ids }}' | tr ',' ' ')" >> $GITHUB_OUTPUT
+          echo "commits_input=$(echo '${{ github.event.inputs.commit_ids }}' | tr ',' ' ')" >> $GITHUB_OUTPUT
+
+
+      # STEP 2 → Fetch commits based on story IDs
+      - name: Find commits from Story IDs
+        id: find_story_commits
+        run: |
+          STORY_COMMITS=""
+          for story in ${{ steps.parse.outputs.stories }}
+          do
+            if [[ -n "$story" ]]; then
+              echo "Searching commits for story: $story"
+              MATCH=$(git log develop --grep "$story" --pretty=format:"%H")
+              STORY_COMMITS="$STORY_COMMITS $MATCH"
+            fi
+          done
+
+          echo "commits=$STORY_COMMITS" >> $GITHUB_OUTPUT
+          echo "Story-based commits found: $STORY_COMMITS"
+
+
+      # STEP 3 → Combine both story commits + manually-entered commits
+      - name: Combine all commits
+        id: combine
+        run: |
+          ALL_COMMITS="${{ steps.find_story_commits.outputs.commits }} ${{ steps.parse.outputs.commits_input }}"
+          ALL_COMMITS=$(echo $ALL_COMMITS | xargs)  # clean whitespace
+          echo "all=$ALL_COMMITS" >> $GITHUB_OUTPUT
+          echo "Final commit list: $ALL_COMMITS"
+
+      # STEP 4 → Fail if there are zero commits
+      - name: Validate commits
+        if: ${{ steps.combine.outputs.all == '' }}
+        run: |
+          echo "❌ No valid commits found. Provide story IDs or commit IDs."
+          exit 1
+
+      # STEP 5 → Create temporary branch
+      - name: Create UAT cherry-pick branch
+        id: branch
+        run: |
+          BRANCH="feature/UAT-cherry-$(date +%s)"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          git checkout -b $BRANCH origin/release/UAT
+          echo "Created branch: $BRANCH"
+
+      # STEP 6 → Cherry-pick each commit
+      - name: Cherry pick all commits
+        run: |
+          for commit in ${{ steps.combine.outputs.all }}
+          do
+            echo "Cherry-picking $commit ..."
+            git cherry-pick $commit || (echo "❌ Conflict detected. Resolve manually."; exit 1)
+          done
+
+      # STEP 7 → Push branch
+      - name: Push cherry-pick branch
+        run: |
+          git push origin HEAD
+
+      # STEP 8 → Open PR into UAT branch
+      - name: Create Pull Request to UAT
+        uses: repo-sync/pull-request@v2
+        with:
+          source_branch: ${{ steps.branch.outputs.branch }}
+          destination_branch: "release/UAT"
+          pr_title: "Cherry Pick → UAT: ${{ github.event.inputs.story_ids }} ${{ github.event.inputs.commit_ids }}"
+          pr_body: |
+            Automated cherry-pick PR for:
+
+            **Story IDs:** ${{ github.event.inputs.story_ids }}
+            **Commit IDs:** ${{ github.event.inputs.commit_ids }}
+
+            **Final Commits Cherry-Picked:**
+            ${{ steps.combine.outputs.all }}
+
+          github_token: ${{ secrets.GITHUB_TOKEN }}
